@@ -1,0 +1,177 @@
+import os
+import re
+import random
+import warnings
+import numpy as np
+import pandas as pd
+import torch
+import torch.nn as nn
+import emoji
+import matplotlib.pyplot as plt
+import seaborn as sns
+from torch.utils.data import Dataset, DataLoader
+from torch.optim import AdamW
+from transformers import AutoTokenizer, RobertaModel, RobertaForSequenceClassification, get_linear_schedule_with_warmup
+from sklearn.metrics import f1_score, confusion_matrix, classification_report
+from tqdm import tqdm
+warnings.filterwarnings("ignore")
+USE_ATTENTION = True  # 🔥 SWITCH MODEL
+MODEL_NAME = "roberta-base"
+MAX_LEN = 160
+BATCH_SIZE = 32
+EPOCHS = 6
+LR = 2e-5
+NUM_LABELS = 28
+OUTPUT_DIR = "results"
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print("\nCUDA:", torch.cuda.is_available())
+if torch.cuda.is_available():
+    print("GPU:", torch.cuda.get_device_name(0))
+GOEMOTION_LABELS = [
+    "admiration","amusement","anger","annoyance","approval","caring",
+    "confusion","curiosity","desire","disappointment","disapproval",
+    "disgust","embarrassment","excitement","fear","gratitude","grief",
+    "joy","love","nervousness","optimism","pride","realization","relief",
+    "remorse","sadness","surprise","neutral"
+]
+def clean_text(text):
+    text = emoji.demojize(str(text))
+    text = text.lower()
+    text = re.sub(r"http\S+|@\w+|#", "", text)
+    return text.strip()
+def load_csv(path):
+    df = pd.read_csv(path)
+    def parse_labels(x):
+        if isinstance(x, str):
+            x = x.strip("[]")
+            return [] if x == "" else [int(i) for i in x.split(",")]
+        return x
+    df["labels"] = df["labels"].apply(parse_labels)
+    def to_multi(label_ids):
+        vec = [0]*NUM_LABELS
+        for lid in label_ids:
+            if lid < NUM_LABELS:
+                vec[lid] = 1
+        return vec
+    df["label"] = df["labels"].apply(to_multi)
+    df["text"] = df["noisy_text"].apply(clean_text)
+    return df[["text","label"]]
+print("Loading data...")
+train_df = load_csv("noisy_train.csv")
+val_df   = load_csv("noisy_val.csv")
+test_df  = load_csv("noisy_test.csv")
+class EmotionDataset(Dataset):
+    def __init__(self, df, tokenizer):
+        self.texts = df["text"].tolist()
+        self.labels = df["label"].tolist()
+        self.tok = tokenizer
+    def __getitem__(self, idx):
+        enc = self.tok(self.texts[idx],
+                       max_length=MAX_LEN,
+                       padding="max_length",
+                       truncation=True,
+                       return_tensors="pt")
+        return {
+            "input_ids": enc["input_ids"].squeeze(),
+            "attention_mask": enc["attention_mask"].squeeze(),
+            "labels": torch.tensor(self.labels[idx], dtype=torch.float)
+        }
+    def __len__(self):
+        return len(self.texts)
+class RobertaWithAttention(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.roberta = RobertaModel.from_pretrained(MODEL_NAME)
+        self.attn = nn.Linear(768,1)
+        self.fc = nn.Linear(768,NUM_LABELS)
+    def forward(self, input_ids, attention_mask):
+        out = self.roberta(input_ids=input_ids, attention_mask=attention_mask)
+        tokens = out.last_hidden_state
+        weights = torch.softmax(self.attn(tokens), dim=1)
+        pooled = (weights * tokens).sum(dim=1)
+        return self.fc(pooled)
+class FocalLoss(nn.Module):
+    def __init__(self, gamma=2):
+        super().__init__()
+        self.gamma = gamma
+        self.bce = nn.BCEWithLogitsLoss(reduction='none')
+    def forward(self, logits, targets):
+        bce = self.bce(logits, targets)
+        probs = torch.sigmoid(logits)
+        pt = torch.where(targets == 1, probs, 1 - probs)
+        return ((1 - pt)**self.gamma * bce).mean()
+def train_epoch(model, loader, optimizer, scheduler, loss_fn):
+    model.train()
+    total_loss = 0
+    for batch in tqdm(loader):
+        optimizer.zero_grad()
+        ids = batch["input_ids"].to(DEVICE)
+        mask = batch["attention_mask"].to(DEVICE)
+        labels = batch["labels"].to(DEVICE)
+        logits = model(ids, mask).logits if not USE_ATTENTION else model(ids, mask)
+        loss = loss_fn(logits, labels)
+        loss.backward()
+        optimizer.step()
+        scheduler.step()
+        total_loss += loss.item()
+    return total_loss/len(loader)
+@torch.no_grad()
+def evaluate(model, loader):
+    model.eval()
+    preds, gold = [], []
+    for batch in loader:
+        ids = batch["input_ids"].to(DEVICE)
+        mask = batch["attention_mask"].to(DEVICE)
+        logits = model(ids, mask).logits if not USE_ATTENTION else model(ids, mask)
+        probs = torch.sigmoid(logits).cpu().numpy()
+        preds.extend((probs > 0.5).astype(int))
+        gold.extend(batch["labels"].numpy())
+    return f1_score(gold, preds, average="macro"), np.array(preds), np.array(gold)
+tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
+train_loader = DataLoader(EmotionDataset(train_df, tokenizer), batch_size=BATCH_SIZE, shuffle=True)
+val_loader   = DataLoader(EmotionDataset(val_df, tokenizer), batch_size=BATCH_SIZE)
+test_loader  = DataLoader(EmotionDataset(test_df, tokenizer), batch_size=BATCH_SIZE)
+model = RobertaWithAttention().to(DEVICE) if USE_ATTENTION else RobertaForSequenceClassification.from_pretrained(
+    MODEL_NAME, num_labels=NUM_LABELS, problem_type="multi_label_classification"
+).to(DEVICE)
+optimizer = AdamW(model.parameters(), lr=LR)
+scheduler = get_linear_schedule_with_warmup(optimizer, 0, len(train_loader)*EPOCHS)
+loss_fn = FocalLoss()
+losses, f1s = [], []
+for epoch in range(EPOCHS):
+    loss = train_epoch(model, train_loader, optimizer, scheduler, loss_fn)
+    f1, _, _ = evaluate(model, val_loader)
+    losses.append(loss)
+    f1s.append(f1)
+    torch.save(model.state_dict(), f"{OUTPUT_DIR}/checkpoint_epoch_{epoch}.pt")
+    print(f"Epoch {epoch+1} | Loss {loss:.4f} | F1 {f1:.4f}")
+plt.figure()
+plt.plot(losses)
+plt.title("Loss")
+plt.savefig(f"{OUTPUT_DIR}/loss.png")
+plt.figure()
+plt.plot(f1s)
+plt.title("Validation F1")
+plt.savefig(f"{OUTPUT_DIR}/f1.png")
+f1, preds, gold = evaluate(model, test_loader)
+print("\nFinal Test F1:", f1)
+cm = confusion_matrix(gold.argmax(axis=1), preds.argmax(axis=1))
+plt.figure(figsize=(10,8))
+sns.heatmap(cm, annot=True, fmt="d")
+plt.title("Confusion Matrix")
+plt.savefig(f"{OUTPUT_DIR}/confusion_matrix.png")
+report = classification_report(gold, preds, target_names=GOEMOTION_LABELS, zero_division=0)
+with open(f"{OUTPUT_DIR}/report.txt", "w") as f:
+    f.write(report)
+print("\nType text (or 'exit'):\n")
+while True:
+    text = input("> ")
+    if text.lower() == "exit":
+        break
+    enc = tokenizer(clean_text(text), return_tensors="pt", truncation=True, padding=True).to(DEVICE)
+    with torch.no_grad():
+        logits = model(**enc).logits if not USE_ATTENTION else model(enc["input_ids"], enc["attention_mask"])
+        probs = torch.sigmoid(logits).cpu().numpy()[0]
+    results = [(GOEMOTION_LABELS[i], round(float(p),3)) for i,p in enumerate(probs) if p>0.5]
+    print(results if results else "No strong emotion detected")
