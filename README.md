@@ -2,13 +2,6 @@
 
 A deep learning-based **multi-label emotion classification app** built using **RoBERTa** and deployed with **Streamlit**.
 This app allows users to input text and detect multiple emotions simultaneously from 28 predefined categories.
-
----
-
-## 🚀 Live Demo
-
-👉 *(Add your deployed link here after hosting)*
-
 ---
 
 ## 📌 Features
